@@ -11,30 +11,117 @@ const ALLOWED_CHANNELS = process.env.ALLOWED_CHANNELS
   ? process.env.ALLOWED_CHANNELS.split(",").map((c) => c.trim())
   : [];
 
-// Custom Skill IDs — comma-separated in .env
-// Run: curl https://api.anthropic.com/v1/skills?source=custom -H "x-api-key: KEY" -H "anthropic-version: 2023-06-01" -H "anthropic-beta: skills-2025-10-02"
-const SKILL_IDS = process.env.SKILL_IDS
-  ? process.env.SKILL_IDS.split(",").map((s) => s.trim())
-  : [];
+// ─── CSV Column Definitions ────────────────────────────────────────────────────
+// These match the exact mca_uivision.csv format
+const CSV_HEADERS = [
+  "Legal Name",
+  "DBA",
+  "Tax ID",
+  "Entity Type",
+  "Start Date",
+  "Industry",
+  "Business Phone",
+  "Address",
+  "City",
+  "State",
+  "ZIP",
+  "Annual Revenue",
+  "Monthly Revenue",
+  "Avg Bank Balance",
+  "Avg Daily Ledger",
+  "Monthly CC Volume",
+  "Bankruptcies",
+  "Judgments",
+  "Tax Liens",
+  "Open MCA",
+  "Federal Contract",
+  "Owner First",
+  "Owner Last",
+  "SSN",
+  "DOB",
+  "Email",
+  "Home Phone",
+  "Cell Phone",
+  "Owner Address",
+  "Owner City",
+  "Owner State",
+  "Owner ZIP",
+  "Ownership %",
+  "Amount Requested",
+  "Purpose",
+  "Bank Stmts Path",
+  "App Path",
+  "Time in Business",
+  "Start Date (OnDeck)",
+  "DOB (OnDeck)",
+  "DOB (Headway)",
+  "Entity Type (Credibly)",
+  "Entity Type (PIRS)",
+];
 
-// System prompt — cached across all requests to save ~90% on input tokens.
-// This prompt is sent once, cached for 5 min, and reused on every subsequent PDF.
-const SYSTEM_PROMPT = `You are a document data extractor for a commercial lending company. Analyze PDF applications and extract every field into structured data.
+// ─── System Prompt ─────────────────────────────────────────────────────────────
+// Cached across all requests to save ~90% on input tokens
+const SYSTEM_PROMPT = `You are a data extractor for MobyCap (ATX Funding Source, LLC). You extract fields from MobyCap PDF credit applications into a specific JSON format.
+
+Extract the following fields from the PDF and return ONLY a valid JSON object. No markdown fences, no explanation, no preamble.
+
+Required JSON keys (use exactly these keys):
+{
+  "legal_name": "Business Legal Name",
+  "dba": "Doing Business As",
+  "tax_id": "Federal Tax ID / EIN",
+  "entity_type_full": "Full entity type (e.g. Limited Liability Company)",
+  "entity_type_short": "Short entity type (e.g. LLC, Corp, Sole Prop)",
+  "start_date": "Business Start Date (MM/DD/YYYY)",
+  "industry": "Industry",
+  "business_phone": "Business Phone with area code",
+  "address": "Business Street Address",
+  "city": "Business City",
+  "state": "Business State",
+  "zip": "Business ZIP",
+  "annual_revenue": "Annual Revenue (numbers with commas, no $)",
+  "monthly_revenue": "Monthly Revenue (numbers with commas, no $)",
+  "amount_requested": "Amount of Capital Requested (numbers with commas, no $)",
+  "purpose": "Purpose of Capital",
+  "estimated_credit_score": "Estimated Credit Score",
+  "current_advances": "Current Advances & Balances",
+  "immediate_capital": "Yes or No",
+  "line_of_credit": "Yes or No",
+  "invoice_factoring": "Yes or No",
+  "equipment_leasing": "Yes or No",
+  "term_loan": "Yes or No",
+  "owner_first": "Owner First Name",
+  "owner_last": "Owner Last Name",
+  "owner_ssn": "Owner SSN (format: XXX-XX-XXXX)",
+  "owner_dob": "Owner Date of Birth (MM/DD/YYYY)",
+  "owner_email": "Owner Email",
+  "owner_phone": "Owner Mobile Phone",
+  "owner_address": "Owner Home Address",
+  "owner_city": "Owner City",
+  "owner_state": "Owner State",
+  "owner_zip": "Owner ZIP",
+  "ownership_pct": "Ownership Percentage (number only)",
+  "owner2_first": "2nd Owner First Name (empty if none)",
+  "owner2_last": "2nd Owner Last Name (empty if none)",
+  "owner2_ssn": "2nd Owner SSN (empty if none)",
+  "owner2_dob": "2nd Owner DOB (empty if none)",
+  "owner2_email": "2nd Owner Email (empty if none)",
+  "owner2_phone": "2nd Owner Phone (empty if none)",
+  "owner2_address": "2nd Owner Address (empty if none)",
+  "owner2_city": "2nd Owner City (empty if none)",
+  "owner2_state": "2nd Owner State (empty if none)",
+  "owner2_zip": "2nd Owner ZIP (empty if none)",
+  "owner2_ownership_pct": "2nd Owner Ownership % (empty if none)",
+  "sign_date": "Date signed"
+}
 
 Rules:
-- Extract ALL visible fields from the PDF application
-- Each key should be the field label as it appears on the form
-- Each value should be the corresponding filled-in value
-- If a field is empty or not filled in, use an empty string ""
-- If there are multiple sections (e.g. Owner 1, Owner 2), prefix keys with the section (e.g. "Owner 1 - Name")
-- For checkboxes or yes/no fields, use "Yes" or "No"
-- For dates, preserve the format as written
-- Flatten everything into a single-level JSON object (no nesting)
-
-Output format: Return ONLY a valid JSON object. No markdown fences, no explanation, no preamble.
-
-Example:
-{"Business Name":"Acme Corp","DBA":"Acme","Business Address":"123 Main St","City":"Austin","State":"TX","Zip":"78701","EIN":"12-3456789","Owner 1 - Name":"John Smith","Owner 1 - SSN":"123-45-6789","Requested Amount":"$50,000","Use of Funds":"Working Capital"}`;
+- If a field is empty or not present, use an empty string ""
+- For checkboxes (funding products), check if they appear to be selected/checked — use "Yes" or "No"
+- Split the owner name into first and last name
+- For revenue/amounts, use numbers with commas but no dollar sign (e.g. "1,200,000" not "$1,200,000.00")
+- For SSN, use format XXX-XX-XXXX (with dashes, no spaces)
+- Return ONLY the JSON object`;
 
 // ─── Initialize Slack & Anthropic ──────────────────────────────────────────────
 const app = new App({
@@ -50,34 +137,18 @@ const anthropic = new Anthropic({
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
-/**
- * Download a file from Slack using the bot token for auth.
- */
 async function downloadSlackFile(url) {
   const response = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
-    },
+    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
   });
-
   if (!response.ok) {
     throw new Error(`Failed to download file: ${response.status} ${response.statusText}`);
   }
-
   const buffer = await response.arrayBuffer();
   return Buffer.from(buffer).toString("base64");
 }
 
-/**
- * Send a PDF to Claude using Skills + code execution (if configured),
- * or direct prompt with caching (default).
- *
- * The system prompt has cache_control set to "ephemeral" so it gets cached
- * for 5 minutes. Since every PDF uses the same system prompt, the 2nd+ request
- * within 5 min pays ~10% of the input cost for the system prompt tokens.
- */
 async function extractFieldsFromPDF(base64Data, fileName) {
-  // ── Build the request ──────────────────────────────────────────────────────
   const requestBody = {
     model: CLAUDE_MODEL,
     max_tokens: 4096,
@@ -102,89 +173,17 @@ async function extractFieldsFromPDF(base64Data, fileName) {
           },
           {
             type: "text",
-            text: `Extract all fields from this PDF application.\n\nFile name: ${fileName}`,
+            text: `Extract all fields from this MobyCap application PDF.\n\nFile name: ${fileName}`,
           },
         ],
       },
     ],
   };
 
-  // ── If custom Skills are configured, use the Skills + code execution endpoint
-  if (SKILL_IDS.length > 0) {
-    requestBody.tools = [
-      { type: "code_execution_20250825", name: "code_execution" },
-    ];
-    requestBody.container = {
-      skills: SKILL_IDS.map((id) => ({
-        type: "custom",
-        skill_id: id,
-        version: "latest",
-      })),
-    };
-
-    // Skills require beta headers — use raw HTTP since the SDK
-    // may not support all beta features yet
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "code-execution-2025-08-25,skills-2025-10-02",
-      },
-      body: JSON.stringify(requestBody),
-    });
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(`Claude API error ${response.status}: ${errorBody}`);
-    }
-
-    let data = await response.json();
-
-    // Handle pause_turn — Skills may need multiple rounds
-    while (data.stop_reason === "pause_turn") {
-      const continueResponse = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": process.env.ANTHROPIC_API_KEY,
-          "anthropic-version": "2023-06-01",
-          "anthropic-beta": "code-execution-2025-08-25,skills-2025-10-02",
-        },
-        body: JSON.stringify({
-          model: CLAUDE_MODEL,
-          max_tokens: 4096,
-          container: { id: data.container.id },
-          system: requestBody.system,
-          messages: [
-            ...requestBody.messages,
-            { role: "assistant", content: data.content },
-            { role: "user", content: "Continue processing." },
-          ],
-          tools: requestBody.tools,
-        }),
-      });
-
-      if (!continueResponse.ok) {
-        const errorBody = await continueResponse.text();
-        throw new Error(`Claude API continue error ${continueResponse.status}: ${errorBody}`);
-      }
-
-      data = await continueResponse.json();
-    }
-
-    return parseClaudeResponse(data.content);
-  }
-
-  // ── Standard path (no Skills) — use SDK with prompt caching ────────────────
   const message = await anthropic.messages.create(requestBody);
   return parseClaudeResponse(message.content);
 }
 
-/**
- * Parse Claude's response content blocks into a JSON object.
- */
 function parseClaudeResponse(content) {
   const rawText = content
     .filter((block) => block.type === "text")
@@ -192,7 +191,6 @@ function parseClaudeResponse(content) {
     .join("\n")
     .trim();
 
-  // Strip markdown fences if Claude wraps them
   const cleaned = rawText
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/i, "")
@@ -206,8 +204,177 @@ function parseClaudeResponse(content) {
 }
 
 /**
- * Escape a value for CSV.
+ * Calculate time in business in years from start date.
  */
+function calcTimeInBusiness(startDate) {
+  if (!startDate) return "";
+  try {
+    const parts = startDate.split("/");
+    if (parts.length !== 3) return "";
+    const start = new Date(parts[2], parts[0] - 1, parts[1]);
+    const now = new Date();
+    const years = Math.floor((now - start) / (365.25 * 24 * 60 * 60 * 1000));
+    return String(years);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Convert MM/DD/YYYY to YYYY-MM-DD (for Headway DOB format).
+ */
+function toISODate(dateStr) {
+  if (!dateStr) return "";
+  try {
+    const parts = dateStr.split("/");
+    if (parts.length !== 3) return "";
+    return `${parts[2]}-${parts[0].padStart(2, "0")}-${parts[1].padStart(2, "0")}`;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Convert MM/DD/YYYY to MM-DD-YYYY (for OnDeck format).
+ */
+function toOnDeckDate(dateStr) {
+  if (!dateStr) return "";
+  return dateStr.replace(/\//g, "-");
+}
+
+/**
+ * Parse a revenue string like "1,800,000" or "$1,800,000.00" into a clean number.
+ */
+function parseRevenue(str) {
+  if (!str) return 0;
+  return parseFloat(str.replace(/[$,]/g, "")) || 0;
+}
+
+/**
+ * Format a number with commas (e.g. 1250000 → "1,250,000").
+ */
+function formatWithCommas(num) {
+  if (!num && num !== 0) return "";
+  // Handle decimals
+  const parts = num.toFixed(2).split(".");
+  parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  // Drop .00 but keep other decimals
+  if (parts[1] === "00") return parts[0];
+  return parts.join(".");
+}
+
+/**
+ * State name to 2-letter abbreviation lookup.
+ */
+const STATE_ABBREVS = {
+  "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+  "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+  "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+  "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+  "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+  "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+  "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+  "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+  "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+  "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+  "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+  "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+  "wisconsin": "WI", "wyoming": "WY", "district of columbia": "DC",
+};
+
+function toStateAbbrev(state) {
+  if (!state) return "";
+  // Already a 2-letter abbreviation
+  if (state.length === 2 && state === state.toUpperCase()) return state;
+  const abbrev = STATE_ABBREVS[state.toLowerCase().trim()];
+  return abbrev || state;
+}
+
+/**
+ * Get short entity type abbreviation.
+ */
+function getEntityTypeShort(entityType) {
+  if (!entityType) return "";
+  const lower = entityType.toLowerCase();
+  if (lower.includes("limited liability")) return "LLC";
+  if (lower.includes("llc")) return "LLC";
+  if (lower.includes("s-corp") || lower.includes("s corp")) return "S-Corp";
+  if (lower.includes("c-corp") || lower.includes("c corp")) return "C-Corp";
+  if (lower.includes("corporation") || lower.includes("corp")) return "Corp";
+  if (lower.includes("sole prop")) return "Sole Prop";
+  if (lower.includes("partnership")) return "Partnership";
+  return entityType;
+}
+
+/**
+ * Map Claude's extracted JSON to the exact mca_uivision.csv column order.
+ * Applies business logic: defaults, calculations, format conversions.
+ */
+function mapToCSVRow(data) {
+  const entityShort = data.entity_type_short || getEntityTypeShort(data.entity_type_full);
+  const startDate = data.start_date || "";
+  const dob = data.owner_dob || "";
+  const legalName = data.legal_name || "";
+
+  // DBA defaults to Legal Name if blank
+  const dba = data.dba || legalName;
+
+  // Revenue calculations
+  const annualRev = parseRevenue(data.annual_revenue);
+  const monthlyRev = data.monthly_revenue ? parseRevenue(data.monthly_revenue) : (annualRev / 12);
+  const avgDailyLedger = monthlyRev > 0 ? (monthlyRev / 30) : 0;
+
+  // State abbreviations
+  const bizState = toStateAbbrev(data.state);
+  const ownerState = toStateAbbrev(data.owner_state);
+
+  return [
+    legalName,                                        // Legal Name
+    dba,                                              // DBA (defaults to Legal Name)
+    data.tax_id || "",                                // Tax ID
+    entityShort,                                      // Entity Type
+    startDate,                                        // Start Date
+    data.industry || "",                              // Industry
+    data.business_phone || "",                        // Business Phone
+    data.address || "",                               // Address
+    data.city || "",                                  // City
+    bizState,                                         // State (2-letter)
+    data.zip || "",                                   // ZIP
+    annualRev ? formatWithCommas(annualRev) : "",     // Annual Revenue
+    monthlyRev ? formatWithCommas(monthlyRev) : "",   // Monthly Revenue
+    monthlyRev ? formatWithCommas(monthlyRev) : "",   // Avg Bank Balance (= Monthly Revenue)
+    avgDailyLedger ? formatWithCommas(avgDailyLedger) : "", // Avg Daily Ledger (Monthly / 30)
+    "",                                               // Monthly CC Volume
+    "Yes",                                            // Bankruptcies (default Yes)
+    "Yes",                                            // Judgments (default Yes)
+    "No",                                             // Tax Liens (default No)
+    "No",                                             // Open MCA (default No)
+    "Yes",                                            // Federal Contract (default Yes)
+    data.owner_first || "",                           // Owner First
+    data.owner_last || "",                            // Owner Last
+    data.owner_ssn || "",                             // SSN
+    dob,                                              // DOB
+    data.owner_email || "",                           // Email
+    data.owner_phone || "",                           // Home Phone
+    data.owner_phone || "",                           // Cell Phone
+    data.owner_address || "",                         // Owner Address
+    data.owner_city || "",                            // Owner City
+    ownerState,                                       // Owner State (2-letter)
+    data.owner_zip || "",                             // Owner ZIP
+    data.ownership_pct || "",                         // Ownership %
+    data.amount_requested || "",                      // Amount Requested
+    data.purpose || "",                               // Purpose
+    "",                                               // Bank Stmts Path
+    "",                                               // App Path
+    calcTimeInBusiness(startDate),                    // Time in Business
+    toOnDeckDate(startDate),                          // Start Date (OnDeck) MM-DD-YYYY
+    toOnDeckDate(dob),                                // DOB (OnDeck) MM-DD-YYYY
+    toISODate(dob),                                   // DOB (Headway) YYYY-MM-DD
+    data.entity_type_full || "",                      // Entity Type (Credibly)
+    entityShort,                                      // Entity Type (PIRS)
+  ];
+}
+
 function csvEscape(value) {
   if (value === null || value === undefined) return "";
   const str = String(value);
@@ -218,30 +385,23 @@ function csvEscape(value) {
 }
 
 /**
- * Convert a flat JSON object to CSV (header row + one data row).
+ * Build the CSV in mca_uivision format: data row first, then header row.
  */
-function jsonToCSV(data) {
-  const keys = Object.keys(data);
-  const headerRow = keys.map(csvEscape).join(",");
-  const dataRow = keys.map((key) => csvEscape(data[key])).join(",");
-  return `${headerRow}\n${dataRow}`;
+function buildMCACSV(data) {
+  const values = mapToCSVRow(data);
+  const dataRow = values.map(csvEscape).join(",");
+  const headerRow = CSV_HEADERS.map(csvEscape).join(",");
+  return `${dataRow}\n${headerRow}\n`;
 }
 
-/**
- * Write CSV to a temp file.
- */
-function writeTempCSV(csvContent, originalFileName) {
-  const baseName = path.basename(originalFileName, path.extname(originalFileName));
-  const csvFileName = `${baseName}_extracted.csv`;
+function writeTempCSV(csvContent) {
+  const csvFileName = "mca_uivision.csv";
   const tmpDir = os.tmpdir();
   const filePath = path.join(tmpDir, csvFileName);
   fs.writeFileSync(filePath, csvContent, "utf-8");
   return { filePath, csvFileName };
 }
 
-/**
- * Check if the channel is allowed.
- */
 function isChannelAllowed(channelId) {
   if (ALLOWED_CHANNELS.length === 0) return true;
   return ALLOWED_CHANNELS.includes(channelId);
@@ -251,16 +411,10 @@ function isChannelAllowed(channelId) {
 
 app.event("message", async ({ event, client, logger }) => {
   try {
-    // Ignore bot messages, edits, and deletions
     if (event.subtype && event.subtype !== "file_share") return;
-
-    // Check if the channel is allowed
     if (!isChannelAllowed(event.channel)) return;
-
-    // Check if the message has file attachments
     if (!event.files || event.files.length === 0) return;
 
-    // Filter for PDF files only
     const pdfFiles = event.files.filter(
       (file) =>
         file.mimetype === "application/pdf" ||
@@ -269,45 +423,39 @@ app.event("message", async ({ event, client, logger }) => {
 
     if (pdfFiles.length === 0) return;
 
-    // React to show we're processing
     await client.reactions.add({
       channel: event.channel,
       timestamp: event.ts,
       name: "hourglass_flowing_sand",
     });
 
-    // Process each PDF
     for (const file of pdfFiles) {
       let tempFilePath = null;
 
       try {
         logger.info(`Processing PDF: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`);
 
-        // Download the file from Slack
         const base64Data = await downloadSlackFile(file.url_private);
-
-        // Send to Claude for field extraction
         const extractedData = await extractFieldsFromPDF(base64Data, file.name);
-        const fieldCount = Object.keys(extractedData).length;
 
-        logger.info(`Extracted ${fieldCount} fields from ${file.name}`);
+        logger.info(`Extracted fields from ${file.name}`);
 
-        // Convert to CSV
-        const csvContent = jsonToCSV(extractedData);
-        const { filePath, csvFileName } = writeTempCSV(csvContent, file.name);
+        // Build CSV in mca_uivision format
+        const csvContent = buildMCACSV(extractedData);
+        const { filePath, csvFileName } = writeTempCSV(csvContent);
         tempFilePath = filePath;
 
-        // Upload the CSV to Slack
+        // Upload as mca_uivision.csv
         await client.filesUploadV2({
           channel_id: event.channel,
           thread_ts: event.ts,
           file: fs.createReadStream(filePath),
           filename: csvFileName,
           title: csvFileName,
-          initial_comment: `📄 Extracted *${fieldCount} fields* from \`${file.name}\``,
+          initial_comment: `📄 Extracted data from \`${file.name}\` → \`mca_uivision.csv\``,
         });
 
-        logger.info(`Uploaded CSV: ${csvFileName}`);
+        logger.info(`Uploaded: ${csvFileName}`);
       } catch (fileError) {
         logger.error(`Error processing file ${file.name}:`, fileError);
 
@@ -317,14 +465,12 @@ app.event("message", async ({ event, client, logger }) => {
           text: `⚠️ Couldn't extract data from \`${file.name}\`. Error: ${fileError.message}`,
         });
       } finally {
-        // Clean up temp file
         if (tempFilePath && fs.existsSync(tempFilePath)) {
           fs.unlinkSync(tempFilePath);
         }
       }
     }
 
-    // Remove the hourglass, add checkmark
     await client.reactions.remove({
       channel: event.channel,
       timestamp: event.ts,
@@ -344,9 +490,8 @@ app.event("message", async ({ event, client, logger }) => {
 
 app.command("/analyze", async ({ command, ack, respond, logger }) => {
   await ack();
-
   await respond({
-    text: "📎 Upload a PDF application to this channel and I'll extract the fields into a CSV for you!",
+    text: "📎 Upload a MobyCap PDF application to this channel and I'll extract it into mca_uivision.csv!",
     response_type: "ephemeral",
   });
 });
@@ -357,9 +502,9 @@ app.command("/analyze", async ({ command, ack, respond, logger }) => {
   const port = process.env.PORT || 3000;
   await app.start(port);
 
-  console.log(`⚡ Slack Claude PDF → CSV Extractor is running`);
+  console.log(`⚡ MobyCap PDF → CSV Extractor is running`);
   console.log(`   Model: ${CLAUDE_MODEL}`);
   console.log(`   Prompt caching: enabled (system prompt cached for 5 min)`);
-  console.log(`   Skills: ${SKILL_IDS.length > 0 ? SKILL_IDS.join(", ") : "None (using direct prompt)"}`);
+  console.log(`   Output: mca_uivision.csv`);
   console.log(`   Channels: ${ALLOWED_CHANNELS.length > 0 ? ALLOWED_CHANNELS.join(", ") : "All channels"}`);
 })();
