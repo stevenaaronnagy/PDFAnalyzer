@@ -11,56 +11,31 @@ const ALLOWED_CHANNELS = process.env.ALLOWED_CHANNELS
   ? process.env.ALLOWED_CHANNELS.split(",").map((c) => c.trim())
   : [];
 
+// Salesforce config
+const SF_DOMAIN = process.env.SF_DOMAIN || "";
+const SF_CLIENT_ID = process.env.SF_CLIENT_ID || "";
+const SF_CLIENT_SECRET = process.env.SF_CLIENT_SECRET || "";
+const MERCHANT_RECORD_TYPE_ID = process.env.SF_MERCHANT_RECORD_TYPE_ID || "0126g000000cifIAAQ";
+const CREDIT_APP_RECORD_TYPE_ID = process.env.SF_CREDIT_APP_RECORD_TYPE_ID || "012Rn00000131QPIAY";
+const FUNDING_EXECUTIVE_ID = process.env.SF_FUNDING_EXECUTIVE_ID || "005Rn0000058R1nIAE";
+
+// In-memory store: maps thread_ts → extracted data from PDF
+const threadDataStore = new Map();
+
 // ─── CSV Column Definitions ────────────────────────────────────────────────────
-// These match the exact mca_uivision.csv format
 const CSV_HEADERS = [
-  "Legal Name",
-  "DBA",
-  "Tax ID",
-  "Entity Type",
-  "Start Date",
-  "Industry",
-  "Business Phone",
-  "Address",
-  "City",
-  "State",
-  "ZIP",
-  "Annual Revenue",
-  "Monthly Revenue",
-  "Avg Bank Balance",
-  "Avg Daily Ledger",
-  "Monthly CC Volume",
-  "Bankruptcies",
-  "Judgments",
-  "Tax Liens",
-  "Open MCA",
-  "Federal Contract",
-  "Owner First",
-  "Owner Last",
-  "SSN",
-  "DOB",
-  "Email",
-  "Home Phone",
-  "Cell Phone",
-  "Owner Address",
-  "Owner City",
-  "Owner State",
-  "Owner ZIP",
-  "Ownership %",
-  "Amount Requested",
-  "Purpose",
-  "Bank Stmts Path",
-  "App Path",
-  "Time in Business",
-  "Start Date (OnDeck)",
-  "DOB (OnDeck)",
-  "DOB (Headway)",
-  "Entity Type (Credibly)",
+  "Legal Name", "DBA", "Tax ID", "Entity Type", "Start Date", "Industry",
+  "Business Phone", "Address", "City", "State", "ZIP", "Annual Revenue",
+  "Monthly Revenue", "Avg Bank Balance", "Avg Daily Ledger", "Monthly CC Volume",
+  "Bankruptcies", "Judgments", "Tax Liens", "Open MCA", "Federal Contract",
+  "Owner First", "Owner Last", "SSN", "DOB", "Email", "Home Phone", "Cell Phone",
+  "Owner Address", "Owner City", "Owner State", "Owner ZIP", "Ownership %",
+  "Amount Requested", "Purpose", "Bank Stmts Path", "App Path", "Time in Business",
+  "Start Date (OnDeck)", "DOB (OnDeck)", "DOB (Headway)", "Entity Type (Credibly)",
   "Entity Type (PIRS)",
 ];
 
 // ─── System Prompt ─────────────────────────────────────────────────────────────
-// Cached across all requests to save ~90% on input tokens
 const SYSTEM_PROMPT = `You are a data extractor for MobyCap (ATX Funding Source, LLC). You extract fields from MobyCap PDF credit applications into a specific JSON format.
 
 Extract the following fields from the PDF and return ONLY a valid JSON object. No markdown fences, no explanation, no preamble.
@@ -135,7 +110,274 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-// ─── Helpers ───────────────────────────────────────────────────────────────────
+// ─── Salesforce Client ─────────────────────────────────────────────────────────
+
+class SalesforceClient {
+  constructor() {
+    this.instanceUrl = null;
+    this.accessToken = null;
+  }
+
+  async authenticate() {
+    const response = await fetch(`https://${SF_DOMAIN}/services/oauth2/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: SF_CLIENT_ID,
+        client_secret: SF_CLIENT_SECRET,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`SF auth failed: ${response.status} ${errText}`);
+    }
+
+    const data = await response.json();
+    this.instanceUrl = data.instance_url;
+    this.accessToken = data.access_token;
+  }
+
+  headers() {
+    return {
+      Authorization: `Bearer ${this.accessToken}`,
+      "Content-Type": "application/json",
+    };
+  }
+
+  async query(soql) {
+    const url = `${this.instanceUrl}/services/data/v59.0/query?q=${encodeURIComponent(soql)}`;
+    const r = await fetch(url, { headers: this.headers() });
+    if (!r.ok) {
+      const errText = await r.text();
+      throw new Error(`SF query failed: ${r.status} ${errText}`);
+    }
+    return r.json();
+  }
+
+  async create(objectName, fields) {
+    const url = `${this.instanceUrl}/services/data/v59.0/sobjects/${objectName}`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify(fields),
+    });
+    if (r.status === 201) {
+      const data = await r.json();
+      return data.id;
+    }
+    const errText = await r.text();
+    throw new Error(`SF create ${objectName} failed: ${r.status} ${errText}`);
+  }
+
+  async update(objectName, recordId, fields) {
+    const url = `${this.instanceUrl}/services/data/v59.0/sobjects/${objectName}/${recordId}`;
+    const r = await fetch(url, {
+      method: "PATCH",
+      headers: this.headers(),
+      body: JSON.stringify(fields),
+    });
+    if (r.status === 204) return recordId;
+    const errText = await r.text();
+    throw new Error(`SF update ${objectName} failed: ${r.status} ${errText}`);
+  }
+}
+
+/**
+ * Find Account by EIN or Business Name, or create a new one.
+ */
+async function findOrCreateAccount(sf, data) {
+  const ein = (data.tax_id || "").replace(/-/g, "").trim();
+  const legalName = data.legal_name || "";
+
+  // Try finding by EIN
+  if (ein) {
+    const result = await sf.query(
+      `SELECT Id FROM Account WHERE McaApp__Federal_Tax_ID_No__c='${ein}' LIMIT 1`
+    );
+    if (result.totalSize > 0) {
+      return { id: result.records[0].Id, method: "ein_match" };
+    }
+  }
+
+  // Try finding by name
+  if (legalName) {
+    const escapedName = legalName.replace(/'/g, "\\'");
+    const result = await sf.query(
+      `SELECT Id FROM Account WHERE Name='${escapedName}' AND RecordTypeId='${MERCHANT_RECORD_TYPE_ID}' LIMIT 1`
+    );
+    if (result.totalSize > 0) {
+      return { id: result.records[0].Id, method: "name_match" };
+    }
+  }
+
+  // Create new Account
+  const accountFields = {};
+  if (legalName) accountFields.Name = legalName;
+  else accountFields.Name = "Unknown";
+  accountFields.RecordTypeId = MERCHANT_RECORD_TYPE_ID;
+  if (ein) accountFields.McaApp__Federal_Tax_ID_No__c = ein;
+  if (data.business_phone) accountFields.Phone = data.business_phone;
+  accountFields.Type = "Prospect";
+
+  const accountId = await sf.create("Account", accountFields);
+  return { id: accountId, method: "created" };
+}
+
+/**
+ * Find existing Credit Application by EIN + Business Name, or return null.
+ */
+async function findCreditApp(sf, data) {
+  const ein = (data.tax_id || "").replace(/-/g, "").trim();
+  const legalName = data.legal_name || "";
+
+  if (ein) {
+    const result = await sf.query(
+      `SELECT Id FROM cloudmaveninc__Credit_Application__c WHERE Federal_Tax_ID__c='${ein}' ORDER BY CreatedDate DESC LIMIT 1`
+    );
+    if (result.totalSize > 0) return result.records[0].Id;
+  }
+
+  if (legalName) {
+    const escapedName = legalName.replace(/'/g, "\\'");
+    const result = await sf.query(
+      `SELECT Id FROM cloudmaveninc__Credit_Application__c WHERE cloudmaveninc__Business_Name_DBA__c='${escapedName}' ORDER BY CreatedDate DESC LIMIT 1`
+    );
+    if (result.totalSize > 0) return result.records[0].Id;
+  }
+
+  return null;
+}
+
+/**
+ * Build Salesforce Credit Application fields from extracted data.
+ */
+function buildCreditAppFields(data, accountId) {
+  const annualRev = parseRevenue(data.annual_revenue);
+  const monthlyRev = data.monthly_revenue ? parseRevenue(data.monthly_revenue) : (annualRev / 12);
+  const amountRequested = parseRevenue(data.amount_requested);
+  const ownershipPct = parseFloat((data.ownership_pct || "").replace(/[^0-9.]/g, "")) || null;
+  const ssn = (data.owner_ssn || "").replace(/-/g, "").trim();
+  const bizState = toStateAbbrev(data.state);
+  const ownerState = toStateAbbrev(data.owner_state);
+
+  const fields = {
+    cloudmaveninc__Account__c: accountId,
+    RecordTypeId: CREDIT_APP_RECORD_TYPE_ID,
+    Funding_Executive__c: FUNDING_EXECUTIVE_ID,
+    OwnerId: FUNDING_EXECUTIVE_ID,
+
+    // Business info
+    cloudmaveninc__Business_Legal_Name__c: data.legal_name || null,
+    cloudmaveninc__Business_Name_DBA__c: data.dba || data.legal_name || null,
+    Federal_Tax_ID__c: data.tax_id || null,
+    cloudmaveninc__Business_Entity_Type__c: data.entity_type_full || null,
+    cloudmaveninc__Business_Inception_New__c: toISODate(data.start_date) || null,
+    cloudmaveninc__Business_Industry__c: data.industry || null,
+    cloudmaveninc__Business_Phone__c: data.business_phone || null,
+    cloudmaveninc__Business_Physical_Street__c: data.address || null,
+    cloudmaveninc__Business_Physical_City__c: data.city || null,
+    cloudmaveninc__Business_Physical_State_Province__c: bizState || null,
+    Business_State__c: bizState || null,
+    cloudmaveninc__Business_Physical_Postal__c: data.zip || null,
+    cloudmaveninc__Business_Country_Location__c: "United States",
+    cloudmaveninc__Business_Mailing_Country__c: "United States",
+
+    // Financials
+    cloudmaveninc__Gross_Annual_Income__c: annualRev || null,
+    cloudmaveninc__Monthly_Income_before_taxes__c: monthlyRev || null,
+    cloudmaveninc__Amount_Requested__c: amountRequested || null,
+    cloudmaveninc__Reason_for_Finance_Request__c: data.purpose || null,
+    cloudmaveninc__Credit_Score__c: data.estimated_credit_score ? parseInt(data.estimated_credit_score) : null,
+    Current_Advances_and_Balances__c: data.current_advances || null,
+
+    // Primary owner
+    cloudmaveninc__Applicant_First_Name__c: data.owner_first || null,
+    cloudmaveninc__Applicant_Last_Name__c: data.owner_last || null,
+    cloudmaveninc__Applicant_SSN_SIN__c: ssn || null,
+    cloudmaveninc__Applicant_Date_of_Birth__c: toISODate(data.owner_dob) || null,
+    cloudmaveninc__Applicant_Email__c: data.owner_email || null,
+    cloudmaveninc__Applicant_Phone__c: data.owner_phone || null,
+    cloudmaveninc__Applicant_Mobile_Phone__c: data.owner_phone || null,
+    cloudmaveninc__Applicant_Physical_Street__c: data.owner_address || null,
+    cloudmaveninc__Applicant_Physical_City__c: data.owner_city || null,
+    cloudmaveninc__Applicant_Physical_State_Province__c: ownerState || null,
+    cloudmaveninc__Applicant_Physical_Postal__c: data.owner_zip || null,
+    cloudmaveninc__Applicant_of_Ownership__c: ownershipPct,
+
+    // 2nd owner (co-applicant)
+    Co_Applicant_1_Name__c: (data.owner2_first && data.owner2_last)
+      ? `${data.owner2_first} ${data.owner2_last}` : null,
+    Co_Applicant_1_SSN__c: data.owner2_ssn ? data.owner2_ssn.replace(/-/g, "") : null,
+    Co_Applicant_1_DOB__c: toISODate(data.owner2_dob) || null,
+    Co_Applicant_1_Email__c: data.owner2_email || null,
+    Co_Applicant_1_Ownership__c: data.owner2_ownership_pct ? parseFloat(data.owner2_ownership_pct) : null,
+    Co_App_1_Physical_Street__c: data.owner2_address || null,
+    Co_App_1_Physical_City__c: data.owner2_city || null,
+    Co_App_1_Physical_State__c: toStateAbbrev(data.owner2_state) || null,
+    Co_App_1_Postal_Code__c: data.owner2_zip || null,
+
+    // Defaults
+    cloudmaveninc__Application_Type__c: "Business",
+    cloudmaveninc__Immigration_Status__c: "US Citizens Only",
+    cloudmaveninc__Credit_Application_Status__c: "Draft",
+  };
+
+  // Remove null values — Salesforce doesn't like them on create
+  const cleaned = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (value !== null && value !== undefined && value !== "") {
+      cleaned[key] = value;
+    }
+  }
+
+  return cleaned;
+}
+
+/**
+ * Main Salesforce upsert: find/create Account, find/create Credit App.
+ */
+async function upsertToSalesforce(data) {
+  if (!SF_DOMAIN || !SF_CLIENT_ID || !SF_CLIENT_SECRET) {
+    throw new Error("Salesforce credentials not configured. Add SF_DOMAIN, SF_CLIENT_ID, SF_CLIENT_SECRET to .env");
+  }
+
+  const sf = new SalesforceClient();
+  await sf.authenticate();
+
+  // Find or create Account
+  const account = await findOrCreateAccount(sf, data);
+
+  // Build Credit App fields
+  const caFields = buildCreditAppFields(data, account.id);
+
+  // Find existing Credit App or create new
+  const existingCaId = await findCreditApp(sf, data);
+
+  let caId, action;
+  if (existingCaId) {
+    // Update existing — remove RecordTypeId and OwnerId to avoid permission issues
+    const updateFields = { ...caFields };
+    delete updateFields.RecordTypeId;
+    delete updateFields.OwnerId;
+    await sf.update("cloudmaveninc__Credit_Application__c", existingCaId, updateFields);
+    caId = existingCaId;
+    action = "updated";
+  } else {
+    caId = await sf.create("cloudmaveninc__Credit_Application__c", caFields);
+    action = "created";
+  }
+
+  return {
+    accountId: account.id,
+    accountMethod: account.method,
+    creditAppId: caId,
+    creditAppAction: action,
+  };
+}
+
+// ─── PDF / CSV Helpers ─────────────────────────────────────────────────────────
 
 async function downloadSlackFile(url) {
   const response = await fetch(url, {
@@ -203,9 +445,6 @@ function parseClaudeResponse(content) {
   }
 }
 
-/**
- * Calculate time in business in years from start date.
- */
 function calcTimeInBusiness(startDate) {
   if (!startDate) return "";
   try {
@@ -220,9 +459,6 @@ function calcTimeInBusiness(startDate) {
   }
 }
 
-/**
- * Convert MM/DD/YYYY to YYYY-MM-DD (for Headway DOB format).
- */
 function toISODate(dateStr) {
   if (!dateStr) return "";
   try {
@@ -234,38 +470,24 @@ function toISODate(dateStr) {
   }
 }
 
-/**
- * Convert MM/DD/YYYY to MM-DD-YYYY (for OnDeck format).
- */
 function toOnDeckDate(dateStr) {
   if (!dateStr) return "";
   return dateStr.replace(/\//g, "-");
 }
 
-/**
- * Parse a revenue string like "1,800,000" or "$1,800,000.00" into a clean number.
- */
 function parseRevenue(str) {
   if (!str) return 0;
   return parseFloat(str.replace(/[$,]/g, "")) || 0;
 }
 
-/**
- * Format a number with commas (e.g. 1250000 → "1,250,000").
- */
 function formatWithCommas(num) {
   if (!num && num !== 0) return "";
-  // Handle decimals
   const parts = num.toFixed(2).split(".");
   parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  // Drop .00 but keep other decimals
   if (parts[1] === "00") return parts[0];
   return parts.join(".");
 }
 
-/**
- * State name to 2-letter abbreviation lookup.
- */
 const STATE_ABBREVS = {
   "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
   "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
@@ -284,15 +506,11 @@ const STATE_ABBREVS = {
 
 function toStateAbbrev(state) {
   if (!state) return "";
-  // Already a 2-letter abbreviation
   if (state.length === 2 && state === state.toUpperCase()) return state;
   const abbrev = STATE_ABBREVS[state.toLowerCase().trim()];
   return abbrev || state;
 }
 
-/**
- * Get short entity type abbreviation.
- */
 function getEntityTypeShort(entityType) {
   if (!entityType) return "";
   const lower = entityType.toLowerCase();
@@ -306,72 +524,36 @@ function getEntityTypeShort(entityType) {
   return entityType;
 }
 
-/**
- * Map Claude's extracted JSON to the exact mca_uivision.csv column order.
- * Applies business logic: defaults, calculations, format conversions.
- */
 function mapToCSVRow(data) {
   const entityShort = data.entity_type_short || getEntityTypeShort(data.entity_type_full);
   const startDate = data.start_date || "";
   const dob = data.owner_dob || "";
   const legalName = data.legal_name || "";
-
-  // DBA defaults to Legal Name if blank
   const dba = data.dba || legalName;
-
-  // Revenue calculations
   const annualRev = parseRevenue(data.annual_revenue);
   const monthlyRev = data.monthly_revenue ? parseRevenue(data.monthly_revenue) : (annualRev / 12);
   const avgDailyLedger = monthlyRev > 0 ? (monthlyRev / 30) : 0;
-
-  // State abbreviations
   const bizState = toStateAbbrev(data.state);
   const ownerState = toStateAbbrev(data.owner_state);
 
   return [
-    legalName,                                        // Legal Name
-    dba,                                              // DBA (defaults to Legal Name)
-    data.tax_id || "",                                // Tax ID
-    entityShort,                                      // Entity Type
-    startDate,                                        // Start Date
-    data.industry || "",                              // Industry
-    data.business_phone || "",                        // Business Phone
-    data.address || "",                               // Address
-    data.city || "",                                  // City
-    bizState,                                         // State (2-letter)
-    data.zip || "",                                   // ZIP
-    annualRev ? formatWithCommas(annualRev) : "",     // Annual Revenue
-    monthlyRev ? formatWithCommas(monthlyRev) : "",   // Monthly Revenue
-    monthlyRev ? formatWithCommas(monthlyRev) : "",   // Avg Bank Balance (= Monthly Revenue)
-    avgDailyLedger ? formatWithCommas(avgDailyLedger) : "", // Avg Daily Ledger (Monthly / 30)
-    "",                                               // Monthly CC Volume
-    "Yes",                                            // Bankruptcies (default Yes)
-    "Yes",                                            // Judgments (default Yes)
-    "No",                                             // Tax Liens (default No)
-    "No",                                             // Open MCA (default No)
-    "Yes",                                            // Federal Contract (default Yes)
-    data.owner_first || "",                           // Owner First
-    data.owner_last || "",                            // Owner Last
-    data.owner_ssn || "",                             // SSN
-    dob,                                              // DOB
-    data.owner_email || "",                           // Email
-    data.owner_phone || "",                           // Home Phone
-    data.owner_phone || "",                           // Cell Phone
-    data.owner_address || "",                         // Owner Address
-    data.owner_city || "",                            // Owner City
-    ownerState,                                       // Owner State (2-letter)
-    data.owner_zip || "",                             // Owner ZIP
-    data.ownership_pct || "",                         // Ownership %
-    data.amount_requested || "",                      // Amount Requested
-    data.purpose || "",                               // Purpose
-    "",                                               // Bank Stmts Path
-    "",                                               // App Path
-    calcTimeInBusiness(startDate),                    // Time in Business
-    toOnDeckDate(startDate),                          // Start Date (OnDeck) MM-DD-YYYY
-    toOnDeckDate(dob),                                // DOB (OnDeck) MM-DD-YYYY
-    toISODate(dob),                                   // DOB (Headway) YYYY-MM-DD
-    data.entity_type_full || "",                      // Entity Type (Credibly)
-    entityShort,                                      // Entity Type (PIRS)
+    legalName, dba, data.tax_id || "", entityShort, startDate,
+    data.industry || "", data.business_phone || "", data.address || "",
+    data.city || "", bizState, data.zip || "",
+    annualRev ? formatWithCommas(annualRev) : "",
+    monthlyRev ? formatWithCommas(monthlyRev) : "",
+    monthlyRev ? formatWithCommas(monthlyRev) : "",
+    avgDailyLedger ? formatWithCommas(avgDailyLedger) : "",
+    "", "Yes", "Yes", "No", "No", "Yes",
+    data.owner_first || "", data.owner_last || "", data.owner_ssn || "",
+    dob, data.owner_email || "", data.owner_phone || "", data.owner_phone || "",
+    data.owner_address || "", data.owner_city || "", ownerState,
+    data.owner_zip || "", data.ownership_pct || "",
+    data.amount_requested || "", data.purpose || "",
+    "", "",
+    calcTimeInBusiness(startDate),
+    toOnDeckDate(startDate), toOnDeckDate(dob), toISODate(dob),
+    data.entity_type_full || "", entityShort,
   ];
 }
 
@@ -384,9 +566,6 @@ function csvEscape(value) {
   return str;
 }
 
-/**
- * Build the CSV in mca_uivision format: data row first, then header row.
- */
 function buildMCACSV(data) {
   const values = mapToCSVRow(data);
   const dataRow = values.map(csvEscape).join(",");
@@ -407,10 +586,22 @@ function isChannelAllowed(channelId) {
   return ALLOWED_CHANNELS.includes(channelId);
 }
 
-// ─── Event Listener ────────────────────────────────────────────────────────────
+// ─── Event Listener: PDF Upload ────────────────────────────────────────────────
 
 app.event("message", async ({ event, client, logger }) => {
   try {
+    // ── Handle "create" keyword in threads ───────────────────────────────────
+    if (
+      event.thread_ts &&
+      !event.subtype &&
+      event.text &&
+      event.text.trim().toLowerCase() === "create"
+    ) {
+      await handleCreateCommand(event, client, logger);
+      return;
+    }
+
+    // ── Handle PDF uploads ───────────────────────────────────────────────────
     if (event.subtype && event.subtype !== "file_share") return;
     if (!isChannelAllowed(event.channel)) return;
     if (!event.files || event.files.length === 0) return;
@@ -440,19 +631,32 @@ app.event("message", async ({ event, client, logger }) => {
 
         logger.info(`Extracted fields from ${file.name}`);
 
-        // Build CSV in mca_uivision format
+        // Store extracted data keyed by thread timestamp for later "create" command
+        const threadTs = event.ts;
+        threadDataStore.set(threadTs, {
+          data: extractedData,
+          fileName: file.name,
+          timestamp: Date.now(),
+        });
+
+        // Clean up old entries (older than 24 hours)
+        const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+        for (const [key, val] of threadDataStore) {
+          if (val.timestamp < oneDayAgo) threadDataStore.delete(key);
+        }
+
+        // Build and upload CSV
         const csvContent = buildMCACSV(extractedData);
         const { filePath, csvFileName } = writeTempCSV(csvContent);
         tempFilePath = filePath;
 
-        // Upload as mca_uivision.csv
         await client.filesUploadV2({
           channel_id: event.channel,
           thread_ts: event.ts,
           file: fs.createReadStream(filePath),
           filename: csvFileName,
           title: csvFileName,
-          initial_comment: `📄 Extracted data from \`${file.name}\` → \`mca_uivision.csv\``,
+          initial_comment: `📄 Extracted data from \`${file.name}\` → \`mca_uivision.csv\`\n\n💡 Reply *create* in this thread to create/update the Salesforce record.`,
         });
 
         logger.info(`Uploaded: ${csvFileName}`);
@@ -486,12 +690,80 @@ app.event("message", async ({ event, client, logger }) => {
   }
 });
 
+// ─── "create" Command Handler ──────────────────────────────────────────────────
+
+async function handleCreateCommand(event, client, logger) {
+  const threadTs = event.thread_ts;
+
+  // Look up the extracted data for this thread
+  const stored = threadDataStore.get(threadTs);
+  if (!stored) {
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: threadTs,
+      text: "⚠️ No extracted data found for this thread. The data may have expired (24hr limit) or the PDF wasn't processed in this thread.",
+    });
+    return;
+  }
+
+  // React to show we're processing
+  await client.reactions.add({
+    channel: event.channel,
+    timestamp: event.ts,
+    name: "hourglass_flowing_sand",
+  });
+
+  try {
+    logger.info(`Salesforce upsert triggered for: ${stored.fileName}`);
+
+    const result = await upsertToSalesforce(stored.data);
+
+    const sfUrl = `${SF_DOMAIN.replace(".my.salesforce.com", "")}.lightning.force.com`;
+
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: threadTs,
+      text: [
+        `✅ *Salesforce record ${result.creditAppAction}!*`,
+        ``,
+        `• *Account:* ${result.accountMethod === "created" ? "Created new" : `Found existing (${result.accountMethod})`}`,
+        `• *Credit Application:* ${result.creditAppAction === "created" ? "Created new" : "Updated existing"}`,
+        `• *Business:* ${stored.data.legal_name || "Unknown"}`,
+        `• *Amount:* ${stored.data.amount_requested || "N/A"}`,
+        ``,
+        `🔗 <https://${sfUrl}/lightning/r/cloudmaveninc__Credit_Application__c/${result.creditAppId}/view|View in Salesforce>`,
+      ].join("\n"),
+    });
+
+    logger.info(`SF upsert complete | Account: ${result.accountId} (${result.accountMethod}) | Credit App: ${result.creditAppId} (${result.creditAppAction})`);
+  } catch (sfError) {
+    logger.error("Salesforce upsert failed:", sfError);
+
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: threadTs,
+      text: `⚠️ Salesforce error: ${sfError.message}`,
+    });
+  }
+
+  // Remove hourglass
+  try {
+    await client.reactions.remove({
+      channel: event.channel,
+      timestamp: event.ts,
+      name: "hourglass_flowing_sand",
+    });
+  } catch {
+    // Ignore if reaction wasn't added
+  }
+}
+
 // ─── Slash Command ─────────────────────────────────────────────────────────────
 
 app.command("/analyze", async ({ command, ack, respond, logger }) => {
   await ack();
   await respond({
-    text: "📎 Upload a MobyCap PDF application to this channel and I'll extract it into mca_uivision.csv!",
+    text: "📎 Upload a MobyCap PDF application to this channel and I'll extract it into mca_uivision.csv!\n\nThen reply *create* in the thread to push it to Salesforce.",
     response_type: "ephemeral",
   });
 });
@@ -502,9 +774,10 @@ app.command("/analyze", async ({ command, ack, respond, logger }) => {
   const port = process.env.PORT || 3000;
   await app.start(port);
 
-  console.log(`⚡ MobyCap PDF → CSV Extractor is running`);
+  console.log(`⚡ MobyCap PDF → CSV + Salesforce Extractor is running`);
   console.log(`   Model: ${CLAUDE_MODEL}`);
   console.log(`   Prompt caching: enabled (system prompt cached for 5 min)`);
   console.log(`   Output: mca_uivision.csv`);
+  console.log(`   Salesforce: ${SF_DOMAIN ? "configured" : "NOT configured (add SF_DOMAIN, SF_CLIENT_ID, SF_CLIENT_SECRET to .env)"}`);
   console.log(`   Channels: ${ALLOWED_CHANNELS.length > 0 ? ALLOWED_CHANNELS.join(", ") : "All channels"}`);
 })();
