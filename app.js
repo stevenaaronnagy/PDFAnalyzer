@@ -272,7 +272,7 @@ function buildCreditAppFields(data, accountId) {
 
     // Business info
     cloudmaveninc__Business_Legal_Name__c: data.legal_name || null,
-    cloudmaveninc__Business_Name_DBA__c: data.dba || data.legal_name || null,
+    cloudmaveninc__Business_Name_DBA__c: data.legal_name || data.dba || null,
     Federal_Tax_ID__c: data.tax_id || null,
     cloudmaveninc__Business_Entity_Type__c: data.entity_type_full || null,
     cloudmaveninc__Business_Inception_New__c: toISODate(data.start_date) || null,
@@ -324,6 +324,7 @@ function buildCreditAppFields(data, accountId) {
     cloudmaveninc__Application_Type__c: "Business",
     cloudmaveninc__Immigration_Status__c: "US Citizens Only",
     cloudmaveninc__Credit_Application_Status__c: "Draft",
+    Lead_Source__c: "OrcaCap",
   };
 
   // Remove null values — Salesforce doesn't like them on create
@@ -338,7 +339,67 @@ function buildCreditAppFields(data, accountId) {
 }
 
 /**
- * Main Salesforce upsert: find/create Account, find/create Credit App.
+ * Find Contact by email or name on the Account, or create a new one.
+ */
+async function findOrCreateContact(sf, data, accountId) {
+  const email = (data.owner_email || "").trim();
+  const firstName = data.owner_first || "";
+  const lastName = data.owner_last || "";
+  const ownerStateFull = toFullStateName(data.owner_state);
+
+  // Try finding by email
+  if (email) {
+    const escapedEmail = email.replace(/'/g, "\\'");
+    const result = await sf.query(
+      `SELECT Id FROM Contact WHERE Email='${escapedEmail}' AND AccountId='${accountId}' LIMIT 1`
+    );
+    if (result.totalSize > 0) {
+      return { id: result.records[0].Id, method: "email_match" };
+    }
+  }
+
+  // Try finding by name on the account
+  if (firstName && lastName) {
+    const escapedFirst = firstName.replace(/'/g, "\\'");
+    const escapedLast = lastName.replace(/'/g, "\\'");
+    const result = await sf.query(
+      `SELECT Id FROM Contact WHERE FirstName='${escapedFirst}' AND LastName='${escapedLast}' AND AccountId='${accountId}' LIMIT 1`
+    );
+    if (result.totalSize > 0) {
+      return { id: result.records[0].Id, method: "name_match" };
+    }
+  }
+
+  // Create new Contact
+  const contactFields = {
+    AccountId: accountId,
+    FirstName: firstName || null,
+    LastName: lastName || "Unknown",
+    Email: email || null,
+    Phone: data.owner_phone || null,
+    MobilePhone: data.owner_phone || null,
+    MailingStreet: data.owner_address || null,
+    MailingCity: data.owner_city || null,
+    MailingState: ownerStateFull || null,
+    MailingPostalCode: data.owner_zip || null,
+    MailingCountry: "United States",
+    Birthdate: toISODate(data.owner_dob) || null,
+  };
+
+  // Remove nulls
+  const cleaned = {};
+  for (const [key, value] of Object.entries(contactFields)) {
+    if (value !== null && value !== undefined && value !== "") {
+      cleaned[key] = value;
+    }
+  }
+
+  const contactId = await sf.create("Contact", cleaned);
+  return { id: contactId, method: "created" };
+}
+
+/**
+ * Main Salesforce upsert: find/create Account, Contact, and Credit App.
  */
 async function upsertToSalesforce(data) {
   if (!SF_DOMAIN || !SF_CLIENT_ID || !SF_CLIENT_SECRET) {
@@ -351,8 +412,15 @@ async function upsertToSalesforce(data) {
   // Find or create Account
   const account = await findOrCreateAccount(sf, data);
 
+  // Find or create Contact
+  const contact = await findOrCreateContact(sf, data, account.id);
+
   // Build Credit App fields
   const caFields = buildCreditAppFields(data, account.id);
+
+  // Link Contact to Credit App as Owner_1__c
+  caFields.Owner_1__c = contact.id;
+  caFields.Point_of_Contact__c = contact.id;
 
   // Find existing Credit App or create new
   const existingCaId = await findCreditApp(sf, data);
@@ -374,6 +442,8 @@ async function upsertToSalesforce(data) {
   return {
     accountId: account.id,
     accountMethod: account.method,
+    contactId: contact.id,
+    contactMethod: contact.method,
     creditAppId: caId,
     creditAppAction: action,
   };
@@ -743,8 +813,10 @@ async function handleCreateCommand(event, client, logger) {
         `✅ *Salesforce record ${result.creditAppAction}!*`,
         ``,
         `• *Account:* ${result.accountMethod === "created" ? "Created new" : `Found existing (${result.accountMethod})`}`,
+        `• *Contact:* ${result.contactMethod === "created" ? "Created new" : `Found existing (${result.contactMethod})`}`,
         `• *Credit Application:* ${result.creditAppAction === "created" ? "Created new" : "Updated existing"}`,
         `• *Business:* ${stored.data.legal_name || "Unknown"}`,
+        `• *Owner:* ${stored.data.owner_first || ""} ${stored.data.owner_last || ""}`,
         `• *Amount:* ${stored.data.amount_requested || "N/A"}`,
         ``,
         `🔗 <https://${sfUrl}/lightning/r/cloudmaveninc__Credit_Application__c/${result.creditAppId}/view|View in Salesforce>`,
