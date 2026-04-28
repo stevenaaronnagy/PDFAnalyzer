@@ -261,6 +261,8 @@ function buildCreditAppFields(data, accountId) {
   const ssn = (data.owner_ssn || "").replace(/-/g, "").trim();
   const bizState = toStateAbbrev(data.state);
   const ownerState = toStateAbbrev(data.owner_state);
+  const bizStateFull = toFullStateName(data.state);
+  const ownerStateFull = toFullStateName(data.owner_state);
 
   const fields = {
     cloudmaveninc__Account__c: accountId,
@@ -278,7 +280,7 @@ function buildCreditAppFields(data, accountId) {
     cloudmaveninc__Business_Phone__c: data.business_phone || null,
     cloudmaveninc__Business_Physical_Street__c: data.address || null,
     cloudmaveninc__Business_Physical_City__c: data.city || null,
-    cloudmaveninc__Business_Physical_State_Province__c: bizState || null,
+    cloudmaveninc__Business_Physical_State_Province__c: bizStateFull || null,
     Business_State__c: bizState || null,
     cloudmaveninc__Business_Physical_Postal__c: data.zip || null,
     cloudmaveninc__Business_Country_Location__c: "United States",
@@ -302,7 +304,7 @@ function buildCreditAppFields(data, accountId) {
     cloudmaveninc__Applicant_Mobile_Phone__c: data.owner_phone || null,
     cloudmaveninc__Applicant_Physical_Street__c: data.owner_address || null,
     cloudmaveninc__Applicant_Physical_City__c: data.owner_city || null,
-    cloudmaveninc__Applicant_Physical_State_Province__c: ownerState || null,
+    cloudmaveninc__Applicant_Physical_State_Province__c: ownerStateFull || null,
     cloudmaveninc__Applicant_Physical_Postal__c: data.owner_zip || null,
     cloudmaveninc__Applicant_of_Ownership__c: ownershipPct,
 
@@ -315,7 +317,7 @@ function buildCreditAppFields(data, accountId) {
     Co_Applicant_1_Ownership__c: data.owner2_ownership_pct ? parseFloat(data.owner2_ownership_pct) : null,
     Co_App_1_Physical_Street__c: data.owner2_address || null,
     Co_App_1_Physical_City__c: data.owner2_city || null,
-    Co_App_1_Physical_State__c: toStateAbbrev(data.owner2_state) || null,
+    Co_App_1_Physical_State__c: data.owner2_state ? toFullStateName(data.owner2_state) : null,
     Co_App_1_Postal_Code__c: data.owner2_zip || null,
 
     // Defaults
@@ -509,6 +511,20 @@ function toStateAbbrev(state) {
   if (state.length === 2 && state === state.toUpperCase()) return state;
   const abbrev = STATE_ABBREVS[state.toLowerCase().trim()];
   return abbrev || state;
+}
+
+/**
+ * Convert 2-letter state abbreviation to full name (for SF picklist fields).
+ */
+const ABBREV_TO_STATE = Object.fromEntries(
+  Object.entries(STATE_ABBREVS).map(([name, abbr]) => [abbr, name.replace(/\b\w/g, c => c.toUpperCase())])
+);
+
+function toFullStateName(state) {
+  if (!state) return "";
+  // Already a full name
+  if (state.length > 2) return state;
+  return ABBREV_TO_STATE[state.toUpperCase()] || state;
 }
 
 function getEntityTypeShort(entityType) {
